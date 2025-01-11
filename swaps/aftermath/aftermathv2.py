@@ -17,7 +17,7 @@ MAX_CONCURRENT_REQUESTS = 5  # max number of simultaneous requests
 MAX_RETRIES = 5              # how many times to retry a request if 429 or network error
 
 # Pagination defaults
-DEFAULT_PAGES = 100
+DEFAULT_PAGES = 1000
 DEFAULT_LIMIT_PER_PAGE = 50
 DEFAULT_DESCENDING = True
 
@@ -31,8 +31,8 @@ _metadata_cache = {}     # coin_type => (decimals, symbol)
 SPECIAL_COINS = {
     "d5fcf6a2947411e145a01e31cf97d43d13d9cd37b7cac2bb3296f7539ebaaf4a::rex::REX": (6, "REX"),
     "f6d855f2876cd5b5bfaa7fcbbb9721f447290606699a6207b4a7757e3eea0ae::sgf::SGF": (6, "SGF"),
-    "f25a3d63032dbf7005453b831862a6831fadf8c501d9cde0e54f2da95b27b470::af_lp::AF_LP": (0,"AF_LP"),
-    "02b8726cb7ddcd879d9e7228c7961ea5deaf5dd72bace57ad9b24f52ff857cd6::af_lp::AF_LP": (0,"AF_LP")
+     "f25a3d63032dbf7005453b831862a6831fadf8c501d9cde0e54f2da95b27b470::af_lp::AF_LP": (0,"AF_LP"),
+     "02b8726cb7ddcd879d9e7228c7961ea5deaf5dd72bace57ad9b24f52ff857cd6::af_lp::AF_LP": (0,"AF_LP")
 }
 
 ###############################################################################
@@ -270,17 +270,17 @@ async def fetch_page(session: aiohttp.ClientSession, event_filter: dict, cursor,
 # 5) PAGINATED EVENT FETCH
 ###############################################################################
 
-async def fetch_aftermathv1_swap_events_paginated(
+async def fetch_aftermathv2_swap_events_paginated(
     session: aiohttp.ClientSession,
     pages=DEFAULT_PAGES,
     limit_per_page=DEFAULT_LIMIT_PER_PAGE,
     descending=DEFAULT_DESCENDING
 ):
     """
-    Asynchronously fetch up to `pages` pages of aftermathv1 SwapEvent objects.
+    Asynchronously fetch up to `pages` pages of aftermathv2 SwapEvent objects.
     """
     event_filter = {
-        "MoveEventType": "0xefe170ec0be4d762196bedecd7a065816576198a6527c99282a2551aaa7da38c::events::SwapEvent"
+        "MoveEventType": "0xc4049b2d1cc0f6e017fda8260e4377cecd236bd7f56a54fee120816e72e2e0dd::events::SwapEventV2"
     }
 
     all_events = []
@@ -412,7 +412,7 @@ async def _fill_single_event_from_cache(session, event: dict):
 # 7) WRITE EVENTS TO CSV
 ###############################################################################
 
-def write_events_to_csv_with_enrichment(events, output_csv="aftermathv1_swap_events.csv"):
+def write_events_to_csv_with_enrichment(events, output_csv="aftermathv2_swap_events.csv"):
     """
     Write the enriched events to CSV, including formatted type information.
     """
@@ -498,7 +498,7 @@ async def main():
     async with aiohttp.ClientSession() as session:
         # 1) Fetch events (paginated)
         print("Starting to fetch events...")
-        events = await fetch_aftermathv1_swap_events_paginated(
+        events = await fetch_aftermathv2_swap_events_paginated(
             session,
             pages=DEFAULT_PAGES,
             limit_per_page=DEFAULT_LIMIT_PER_PAGE,
@@ -520,7 +520,7 @@ async def main():
         # 3) Write them to CSV
         print("Starting to write events to CSV...")
         start_csv = time.time()
-        output_csv = "aftermathv1_swap_events.csv"
+        output_csv = "aftermathv2_swap_events.csv"
         write_events_to_csv_with_enrichment(events, output_csv)
         end_csv = time.time()
         print(f"Wrote events to {output_csv} in {end_csv - start_csv:.2f} seconds.")
