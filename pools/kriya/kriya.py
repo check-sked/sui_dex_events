@@ -23,11 +23,46 @@ MAX_RETRIES = 5
 ###############################################################################
 
 DEX_CONFIGS = {
-    "aftermath": {
-        "name": "Aftermath",
-        "package_id": "0xefe170ec0be4d762196bedecd7a065816576198a6527c99282a2551aaa7da38c",
+    "kriya_0xa0eb": {
+        "name": "Kriya",
+        "package_id": "0xa0eba10b173538c8fecca1dff298e488402cc9ff374f8a12ca7758eebe830b66",
         "event_query": {
-            "MoveEventType": "0xefe170ec0be4d762196bedecd7a065816576198a6527c99282a2551aaa7da38c::events::CreatedPoolEvent"
+            "MoveEventType": "0xa0eba10b173538c8fecca1dff298e488402cc9ff374f8a12ca7758eebe830b66::spot_dex::PoolCreatedEvent"
+        }
+    },
+    "kriya_0x1b55": {
+        "name": "Kriya",
+        "package_id": "0x1b55d504f53203d203f133a6dfe48d0c9e3fb2930d377c54fe9267e4f44ee221",
+        "event_query": {
+            "MoveEventType": "0x1b55d504f53203d203f133a6dfe48d0c9e3fb2930d377c54fe9267e4f44ee221::spot_dex::PoolCreatedEvent"
+        }
+    },
+    "kriya_0xe21d": {
+        "name": "Kriya",
+        "package_id": "0xe21db388008bb1a2f817c58a6cd4b533fe03fa42db123f98764e34d2fe78921b",
+        "event_query": {
+            "MoveEventType": "0xe21db388008bb1a2f817c58a6cd4b533fe03fa42db123f98764e34d2fe78921b::spot_dex::PoolCreatedEvent"
+        }
+    },
+    "kriya_0xf6c0": {
+        "name": "Kriya",
+        "package_id": "0xf6c05e2d9301e6e91dc6ab6c3ca918f7d55896e1f1edd64adc0e615cde27ebf1",
+        "event_query": {
+            "MoveEventType": "0xf6c05e2d9301e6e91dc6ab6c3ca918f7d55896e1f1edd64adc0e615cde27ebf1::create_pool::PoolCreatedEvent"
+        }
+    },
+    "kriya_0x40b": {
+        "name": "Kriya",
+        "package_id": "0x40b6713907acadc6c8b8d9d98f36d2f24f80bd08440d5477f9f868e3b5e1e12d",
+        "event_query": {
+            "MoveEventType": "0x40b6713907acadc6c8b8d9d98f36d2f24f80bd08440d5477f9f868e3b5e1e12d::create_pool::PoolCreatedEvent"
+        }
+    },
+    "kriya_0xe511": {
+        "name": "Kriya",
+        "package_id": "0xe5113bcc9e8671a713dd86d61a5a05da06fafe8c097ac0a85f943b353717c420",
+        "event_query": {
+            "MoveEventType": "0xe5113bcc9e8671a713dd86d61a5a05da06fafe8c097ac0a85f943b353717c420::spot_dex::PoolCreatedEvent"
         }
     }
 }
@@ -38,7 +73,7 @@ DEX_CONFIGS = {
 
 _pool_cache: Dict[str, Tuple[str, str]] = {}
 _metadata_cache: Dict[str, Tuple[int, str]] = {}
-_timestamp_cache: Dict[str, int] = {}  # New cache for timestamps
+_timestamp_cache: Dict[str, int] = {}  # Cache for timestamps
 
 ###############################################################################
 # Core Network Functions
@@ -77,7 +112,7 @@ async def safe_post(session: aiohttp.ClientSession, url: str, json_data: dict, r
 ###############################################################################
 
 async def get_all_pools_from_events(session: aiohttp.ClientSession, event_filter: dict) -> List[Tuple[str, int]]:
-    """Discover all pools by querying PoolCreatedEvents. Now returns tuples of (pool_id, timestamp)."""
+    """Discover all pools by querying PoolCreatedEvents. Returns tuples of (pool_id, timestamp)."""
     pools = {}  # Using dict to store pool_id: timestamp
     cursor = None
     
@@ -160,13 +195,13 @@ async def get_pool_details(session: aiohttp.ClientSession, pool_id: str) -> Tupl
         data = result.get("result", {}).get("data", {})
         if not data:
             print(f"No data found for pool {pool_id}")
-            return ("Unknown", "Unknown")
+            return {}, ("Unknown", "Unknown")
 
         content = data.get("content", {})
         fields = content.get("fields", {})
         
         pool_details = {
-            'fee': fields.get('fee_percent', None),  # Get raw fee value without conversion
+            'swap_fee_rate': fields.get('swap_fee_rate', None),
             'weight_a': float(fields.get('weight_a', 50)) / 100 if 'weight_a' in fields else 0.5,
             'weight_b': float(fields.get('weight_b', 50)) / 100 if 'weight_b' in fields else 0.5
         }
@@ -175,7 +210,7 @@ async def get_pool_details(session: aiohttp.ClientSession, pool_id: str) -> Tupl
         if "type_names" in fields and isinstance(fields["type_names"], list):
             coin_types = fields["type_names"]
             if len(coin_types) == 2:
-                _pool_cache[pool_id] = tuple(coin_types)
+                _pool_cache[pool_id] = (pool_details, tuple(coin_types))
                 print(f"Successfully found coins from type_names: {coin_types}")
                 return pool_details, tuple(coin_types)
 
@@ -185,7 +220,7 @@ async def get_pool_details(session: aiohttp.ClientSession, pool_id: str) -> Tupl
             inside = type_str.split("Pool<", 1)[1].rstrip(">")
             coin_types = [t.strip() for t in inside.split(",")]
             if len(coin_types) == 2:
-                _pool_cache[pool_id] = tuple(coin_types)
+                _pool_cache[pool_id] = (pool_details, tuple(coin_types))
                 print(f"Successfully found coins from type string: {coin_types}")
                 return pool_details, tuple(coin_types)
 
@@ -194,7 +229,7 @@ async def get_pool_details(session: aiohttp.ClientSession, pool_id: str) -> Tupl
 
     except Exception as e:
         print(f"Error fetching pool {pool_id}: {str(e)}")
-        return ("Unknown", "Unknown")
+        return {}, ("Unknown", "Unknown")
 
 async def get_coin_metadata(session: aiohttp.ClientSession, coin_type: str) -> Tuple[int, str]:
     """Get metadata for a coin type."""
@@ -284,9 +319,9 @@ async def analyze_pool(session: aiohttp.ClientSession, pool_id: str, dex_name: s
             "coin_b_symbol": meta_b[1],
             "coin_b_decimals": meta_b[0],
             # Pool parameters
-            "fee": pool_details['fee'],
-            "weight_a": pool_details['weight_a'],
-            "weight_b": pool_details['weight_b']
+            "swap_fee_rate": pool_details.get('swap_fee_rate'),
+            "weight_a": pool_details.get('weight_a', 0.5),
+            "weight_b": pool_details.get('weight_b', 0.5)
         }
         
         print(f"✅ Successfully created pool info: {json.dumps(pool_info, indent=2)}")
@@ -309,7 +344,7 @@ async def analyze_pool(session: aiohttp.ClientSession, pool_id: str, dex_name: s
             "coin_b_symbol": "UNKNOWN",
             "coin_b_decimals": 0,
             # Pool parameters
-            "fee": None,
+            "swap_fee_rate": None,
             "weight_a": 0.5,
             "weight_b": 0.5
         }
@@ -320,7 +355,7 @@ async def analyze_pool(session: aiohttp.ClientSession, pool_id: str, dex_name: s
 # CSV Output Functions
 ###############################################################################
 
-def write_pools_to_csv(pools: List[dict], filename: str = "aftermath_dex_pools.csv"):
+def write_pools_to_csv(pools: List[dict], filename: str = "kriya_dex_pools.csv"):
     """Write discovered pools to CSV."""
     if not pools:
         print("No pools to write to CSV")
@@ -342,7 +377,7 @@ def write_pools_to_csv(pools: List[dict], filename: str = "aftermath_dex_pools.c
         "coin_b_symbol",
         "coin_b_decimals",
         # Pool parameters
-        "fee",
+        "swap_fee_rate",
         "weight_a",
         "weight_b"
     ]
@@ -368,22 +403,26 @@ async def main():
     async with aiohttp.ClientSession() as session:
         all_pools = []
         
-        for dex_name, config in DEX_CONFIGS.items():
+        for dex_key, config in DEX_CONFIGS.items():
             print(f"\nProcessing {config['name']}...")
             
-            pool_tuples = await get_all_pools_from_events(session, config['event_query'])
-            print(f"Found {len(pool_tuples)} total pools")
-            
-            for i, (pool_id, _) in enumerate(pool_tuples):
-                print(f"Analyzing pool {i+1}/{len(pool_tuples)}: {pool_id}")
-                pool_info = await analyze_pool(session, pool_id, dex_name)
-                if pool_info:
-                    all_pools.append(pool_info)
-                    print(f"Added pool with coins: {pool_info['coin_a_symbol']}-{pool_info['coin_b_symbol']}")
-                else:
-                    print(f"Pool analysis returned None for pool_id: {pool_id}")
+            try:
+                pool_tuples = await get_all_pools_from_events(session, config['event_query'])
+                print(f"Found {len(pool_tuples)} total pools for {config['name']}")
+                
+                for i, (pool_id, _) in enumerate(pool_tuples):
+                    print(f"Analyzing pool {i+1}/{len(pool_tuples)}: {pool_id} from {config['name']}")
+                    pool_info = await analyze_pool(session, pool_id, dex_key)
+                    if pool_info:
+                        all_pools.append(pool_info)
+                        print(f"Added pool with coins: {pool_info['coin_a_symbol']}-{pool_info['coin_b_symbol']}")
+                    else:
+                        print(f"Pool analysis returned None for pool_id: {pool_id}")
+            except Exception as e:
+                print(f"Error processing {config['name']}: {str(e)}")
+                continue
         
-        print(f"\nTotal pools found: {len(all_pools)}")
+        print(f"\nTotal pools found across all versions: {len(all_pools)}")
         write_pools_to_csv(all_pools)
 
 if __name__ == "__main__":
