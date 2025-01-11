@@ -6,6 +6,7 @@ import time
 from datetime import datetime
 import json
 from typing import Dict, List, Optional, Tuple
+import traceback
 
 ###############################################################################
 # CONFIG
@@ -22,8 +23,8 @@ MAX_RETRIES = 5
 ###############################################################################
 
 DEX_CONFIGS = {
-    "aftermathv1": {
-        "name": "Aftermath v1",
+    "aftermath": {
+        "name": "Aftermath",
         "package_id": "0xefe170ec0be4d762196bedecd7a065816576198a6527c99282a2551aaa7da38c",
         "event_query": {
             "MoveEventType": "0xefe170ec0be4d762196bedecd7a065816576198a6527c99282a2551aaa7da38c::events::CreatedPoolEvent"
@@ -37,6 +38,7 @@ DEX_CONFIGS = {
 
 _pool_cache: Dict[str, Tuple[str, str]] = {}
 _metadata_cache: Dict[str, Tuple[int, str]] = {}
+_timestamp_cache: Dict[str, int] = {}  # New cache for timestamps
 
 ###############################################################################
 # Core Network Functions
@@ -74,9 +76,9 @@ async def safe_post(session: aiohttp.ClientSession, url: str, json_data: dict, r
 # Pool Discovery Functions
 ###############################################################################
 
-async def get_all_pools_from_events(session: aiohttp.ClientSession, event_filter: dict) -> List[str]:
-    """Discover all pools by querying PoolCreatedEvents."""
-    pools = set()
+async def get_all_pools_from_events(session: aiohttp.ClientSession, event_filter: dict) -> List[Tuple[str, int]]:
+    """Discover all pools by querying PoolCreatedEvents. Now returns tuples of (pool_id, timestamp)."""
+    pools = {}  # Using dict to store pool_id: timestamp
     cursor = None
     
     while True:
@@ -99,13 +101,15 @@ async def get_all_pools_from_events(session: aiohttp.ClientSession, event_filter
             for event in data.get("data", []):
                 try:
                     parsed_json = event.get("parsedJson", {})
+                    timestamp_ms = int(event.get("timestampMs", 0))  # Get timestamp from event
                     
                     pool_id = parsed_json.get("pool_id")
                     if pool_id:
                         if not pool_id.startswith("0x"):
                             pool_id = "0x" + pool_id
-                        pools.add(pool_id)
-                        print(f"Successfully extracted pool ID: {pool_id}")
+                        pools[pool_id] = timestamp_ms
+                        _timestamp_cache[pool_id] = timestamp_ms  # Cache the timestamp
+                        print(f"Successfully extracted pool ID: {pool_id} (created at: {datetime.fromtimestamp(timestamp_ms/1000)})")
                         
                         # Also print coin information for debugging
                         coins = parsed_json.get("coins", [])
@@ -124,14 +128,14 @@ async def get_all_pools_from_events(session: aiohttp.ClientSession, event_filter
             print(f"Error fetching events: {e}")
             break
     
-    return list(pools)
+    return [(pool_id, timestamp) for pool_id, timestamp in pools.items()]
 
 ###############################################################################
 # Pool Analysis Functions
 ###############################################################################
 
-async def get_pool_coins(session: aiohttp.ClientSession, pool_id: str) -> Tuple[str, str]:
-    """Get coin types for a pool with enhanced debugging."""
+async def get_pool_details(session: aiohttp.ClientSession, pool_id: str) -> Tuple[dict, Tuple[str, str]]:
+    """Get detailed pool information including coins, reserves, and other fields."""
     if pool_id in _pool_cache:
         return _pool_cache[pool_id]
 
@@ -161,13 +165,19 @@ async def get_pool_coins(session: aiohttp.ClientSession, pool_id: str) -> Tuple[
         content = data.get("content", {})
         fields = content.get("fields", {})
         
-        # Check for type_names field first as it contains the actual coin types
+        pool_details = {
+            'fee': fields.get('fee_percent', None),  # Get raw fee value without conversion
+            'weight_a': float(fields.get('weight_a', 50)) / 100 if 'weight_a' in fields else 0.5,
+            'weight_b': float(fields.get('weight_b', 50)) / 100 if 'weight_b' in fields else 0.5
+        }
+
+        # Get coin types
         if "type_names" in fields and isinstance(fields["type_names"], list):
             coin_types = fields["type_names"]
             if len(coin_types) == 2:
                 _pool_cache[pool_id] = tuple(coin_types)
                 print(f"Successfully found coins from type_names: {coin_types}")
-                return tuple(coin_types)
+                return pool_details, tuple(coin_types)
 
         # Fallback to previous methods if type_names not found
         type_str = data.get("type", "")
@@ -177,10 +187,10 @@ async def get_pool_coins(session: aiohttp.ClientSession, pool_id: str) -> Tuple[
             if len(coin_types) == 2:
                 _pool_cache[pool_id] = tuple(coin_types)
                 print(f"Successfully found coins from type string: {coin_types}")
-                return tuple(coin_types)
+                return pool_details, tuple(coin_types)
 
         print("Could not find valid coin types")
-        return ("Unknown", "Unknown")
+        return pool_details, ("Unknown", "Unknown")
 
     except Exception as e:
         print(f"Error fetching pool {pool_id}: {str(e)}")
@@ -239,38 +249,72 @@ async def get_coin_metadata(session: aiohttp.ClientSession, coin_type: str) -> T
         return (9, module_name)
 
 async def analyze_pool(session: aiohttp.ClientSession, pool_id: str, dex_name: str) -> Optional[dict]:
-    """Analyze a single pool and return its details."""
-    print(f"Analyzing pool: {pool_id}")
+    """Analyze a single pool and return its details, including unknown pools."""
+    print(f"\n=== Starting analysis for pool: {pool_id} ===")
     
     try:
-        coins = await get_pool_coins(session, pool_id)
-        if coins == ("Unknown", "Unknown"):
-            print(f"Could not get coins for pool {pool_id}")
-            return None
-            
+        print("Fetching pool details...")
+        pool_details, coins = await get_pool_details(session, pool_id)
         coin_a, coin_b = coins
         print(f"Found coins: {coin_a}, {coin_b}")
         
+        # Get metadata even for "Unknown" coins
+        print("Fetching metadata for coin A...")
         meta_a = await get_coin_metadata(session, coin_a)
+        print(f"Got metadata for coin A: {meta_a}")
+        
+        print("Fetching metadata for coin B...")
         meta_b = await get_coin_metadata(session, coin_b)
+        print(f"Got metadata for coin B: {meta_b}")
+        
+        # Get timestamp from cache
+        timestamp = _timestamp_cache.get(pool_id, 0)
+        created_at = datetime.fromtimestamp(timestamp/1000).isoformat() if timestamp else "Unknown"
         
         pool_info = {
             "pool_id": pool_id,
             "dex": dex_name,
+            "created_at": created_at,
+            # Coin A details
             "coin_a": coin_a,
             "coin_a_symbol": meta_a[1],
             "coin_a_decimals": meta_a[0],
+            # Coin B details
             "coin_b": coin_b,
             "coin_b_symbol": meta_b[1],
-            "coin_b_decimals": meta_b[0]
+            "coin_b_decimals": meta_b[0],
+            # Pool parameters
+            "fee": pool_details['fee'],
+            "weight_a": pool_details['weight_a'],
+            "weight_b": pool_details['weight_b']
         }
         
-        print(f"Successfully analyzed pool: {json.dumps(pool_info, indent=2)}")
+        print(f"✅ Successfully created pool info: {json.dumps(pool_info, indent=2)}")
         return pool_info
         
     except Exception as e:
-        print(f"Error analyzing pool {pool_id}: {e}")
-        return None
+        print(f"❌ Error analyzing pool {pool_id}: {str(e)}")
+        print(f"Stack trace: {traceback.format_exc()}")
+        # Instead of returning None, return a pool info with unknown values
+        return {
+            "pool_id": pool_id,
+            "dex": dex_name,
+            "created_at": "Unknown",
+            # Coin A details
+            "coin_a": "Unknown",
+            "coin_a_symbol": "UNKNOWN",
+            "coin_a_decimals": 0,
+            # Coin B details
+            "coin_b": "Unknown",
+            "coin_b_symbol": "UNKNOWN",
+            "coin_b_decimals": 0,
+            # Pool parameters
+            "fee": None,
+            "weight_a": 0.5,
+            "weight_b": 0.5
+        }
+    finally:
+        print(f"=== Finished analysis for pool: {pool_id} ===\n")
 
 ###############################################################################
 # CSV Output Functions
@@ -288,12 +332,19 @@ def write_pools_to_csv(pools: List[dict], filename: str = "sui_dex_pools.csv"):
     fieldnames = [
         "pool_id",
         "dex",
+        "created_at",
+        # Coin A details
         "coin_a",
         "coin_a_symbol",
         "coin_a_decimals",
+        # Coin B details
         "coin_b",
         "coin_b_symbol",
-        "coin_b_decimals"
+        "coin_b_decimals",
+        # Pool parameters
+        "fee",
+        "weight_a",
+        "weight_b"
     ]
     
     try:
@@ -316,19 +367,15 @@ async def main():
     """Main execution function"""
     async with aiohttp.ClientSession() as session:
         all_pools = []
-        MAX_POOLS = 100  # Limit to 100 pools for testing
         
         for dex_name, config in DEX_CONFIGS.items():
             print(f"\nProcessing {config['name']}...")
             
-            pool_ids = await get_all_pools_from_events(session, config['event_query'])
-            print(f"Found {len(pool_ids)} total pools (limiting to {MAX_POOLS} for testing)")
+            pool_tuples = await get_all_pools_from_events(session, config['event_query'])
+            print(f"Found {len(pool_tuples)} total pools")
             
-            # Limit pool_ids to first 10
-            pool_ids = pool_ids[:MAX_POOLS]
-            
-            for i, pool_id in enumerate(pool_ids):
-                print(f"Analyzing pool {i+1}/{len(pool_ids)}: {pool_id}")
+            for i, (pool_id, _) in enumerate(pool_tuples):
+                print(f"Analyzing pool {i+1}/{len(pool_tuples)}: {pool_id}")
                 pool_info = await analyze_pool(session, pool_id, dex_name)
                 if pool_info:
                     all_pools.append(pool_info)
