@@ -11,12 +11,11 @@ from datetime import datetime
 
 RPC_URL = "https://fullnode.mainnet.sui.io:443"
 
-# Adjust these to tune concurrency and retries
-MAX_CONCURRENT_REQUESTS = 5  # max number of simultaneous requests
-MAX_RETRIES = 5              # how many times to retry a request if 429 or network error
+MAX_CONCURRENT_REQUESTS = 5
+MAX_RETRIES = 5 
 
-# Pagination defaults
-DEFAULT_PAGES = 1000
+# Pagination
+DEFAULT_PAGES = 10
 DEFAULT_LIMIT_PER_PAGE = 50
 DEFAULT_DESCENDING = True
 
@@ -25,6 +24,7 @@ DEFAULT_DESCENDING = True
 ###############################################################################
 _pool_cache = {}         # pool_id => (coinA, coinB)
 _metadata_cache = {}     # coin_type => (decimals, symbol)
+_tx_cache = {}          # tx_digest => (checkpoint, timestamp)
 
 ###############################################################################
 # 1) SEMAPHORE + SAFE POST WITH RETRIES
@@ -41,7 +41,6 @@ async def safe_post(session: aiohttp.ClientSession, url: str, json_data: dict, r
             try:
                 async with session.post(url, json=json_data) as resp:
                     if resp.status == 429:
-                        # Rate-limited; wait and retry
                         await asyncio.sleep(backoff + random.random())
                         backoff *= 2
                         continue
@@ -100,7 +99,6 @@ async def get_pool_coins(session: aiohttp.ClientSession, pool_id: str):
     coin_type_a = None
     coin_type_b = None
 
-    # Attempt parsing from obj_data["type"] first
     type_str = obj_data.get("type", "")
     if "Pool<" in type_str:
         inside = type_str.split("Pool<", 1)[1].rstrip(">")
@@ -108,7 +106,6 @@ async def get_pool_coins(session: aiohttp.ClientSession, pool_id: str):
         if len(parts) == 2:
             coin_type_a, coin_type_b = parts
 
-    # Or fallback to content.fields
     content = obj_data.get("content", {})
     fields = content.get("fields", {})
     if not coin_type_a:
@@ -164,7 +161,48 @@ async def get_coin_metadata(session: aiohttp.ClientSession, coin_type: str):
     return (decimals, symbol)
 
 ###############################################################################
-# 4) FETCH A SINGLE PAGE OF EVENTS
+# 4) GET TRANSACTION BLOCK INFO (ASYNC) WITH CACHE
+###############################################################################
+
+async def get_tx_block_info(session: aiohttp.ClientSession, tx_digest: str):
+    """
+    Fetch transaction block info including checkpoint number.
+    Caches results to avoid repeated network calls.
+    """
+    if tx_digest in _tx_cache:
+        return _tx_cache[tx_digest]
+
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "sui_getTransactionBlock",
+        "params": [
+            tx_digest,
+            {
+                "showEffects": True,
+                "showInput": False,
+                "showRawInput": False,
+                "showEvents": False
+            }
+        ]
+    }
+
+    try:
+        result = await safe_post(session, RPC_URL, payload)
+        data = result.get("result", {})
+        
+        checkpoint = data.get("checkpoint", None)
+        timestamp = data.get("timestampMs", None)
+        
+        _tx_cache[tx_digest] = (checkpoint, timestamp)
+        return (checkpoint, timestamp)
+    except Exception as e:
+        print(f"Error fetching tx block info for {tx_digest}: {e}")
+        _tx_cache[tx_digest] = (None, None)
+        return (None, None)
+
+###############################################################################
+# 5) FETCH A SINGLE PAGE OF EVENTS
 ###############################################################################
 
 async def fetch_page(session: aiohttp.ClientSession, event_filter: dict, cursor, limit_per_page, descending):
@@ -186,7 +224,7 @@ async def fetch_page(session: aiohttp.ClientSession, event_filter: dict, cursor,
     return data["result"]
 
 ###############################################################################
-# 5) PAGINATED EVENT FETCH
+# 6) PAGINATED EVENT FETCH
 ###############################################################################
 
 async def fetch_cetus_swap_events_paginated(
@@ -219,46 +257,8 @@ async def fetch_cetus_swap_events_paginated(
     return all_events
 
 ###############################################################################
-# 6) BATCHED ENRICHMENT: PRE-FETCH POOL AND COIN METADATA
+# 7) FILL SINGLE EVENT FROM CACHE
 ###############################################################################
-
-async def enrich_events_with_pool_and_coin_data(session, events):
-    """
-    Faster approach:
-      - Gather all unique pools, fetch them in parallel
-      - Gather all unique coin types from those pools, fetch them in parallel
-      - Final pass to fill event data from the now-cached data
-    """
-    # 1) Gather unique pool IDs
-    unique_pool_ids = set()
-    for e in events:
-        pjson = e.get("parsedJson", {})
-        pool_id = pjson.get("pool", "")
-        if pool_id:
-            unique_pool_ids.add(pool_id)
-
-    # 2) Fetch each pool (in parallel)
-    pool_tasks = [asyncio.create_task(get_pool_coins(session, pid)) for pid in unique_pool_ids]
-    await asyncio.gather(*pool_tasks)
-
-    # 3) Gather all unique coin types from those pools
-    unique_coin_types = set()
-    for pid in unique_pool_ids:
-        coin_a, coin_b = _pool_cache.get(pid, ("Unknown", "Unknown"))
-        if coin_a: 
-            unique_coin_types.add(coin_a)
-        if coin_b:
-            unique_coin_types.add(coin_b)
-
-    # 4) Fetch each coin metadata (in parallel)
-    coin_tasks = [asyncio.create_task(get_coin_metadata(session, ctype)) for ctype in unique_coin_types]
-    await asyncio.gather(*coin_tasks)
-
-    # 5) Final pass: fill each event using the cached data
-    for e in events:
-        await _fill_single_event_from_cache(e)
-
-    return events
 
 async def _fill_single_event_from_cache(event: dict):
     """
@@ -292,7 +292,6 @@ async def _fill_single_event_from_cache(event: dict):
     in_decimals, in_symbol = _metadata_cache.get(token_in, (0, "UNKNOWN"))
     out_decimals, out_symbol = _metadata_cache.get(token_out, (0, "UNKNOWN"))
 
-    # Convert raw amount to decimal
     def parse_decimal(amount_str, decimals):
         try:
             raw_int = int(amount_str)
@@ -315,16 +314,57 @@ async def _fill_single_event_from_cache(event: dict):
     event["token_out_decimal_amount"] = out_decimal_amt
 
 ###############################################################################
-# 7) WRITE EVENTS TO CSV
+# 8) BATCHED ENRICHMENT
+###############################################################################
+
+async def enrich_events_with_all_data(session, events):
+    unique_pool_ids = set()
+    unique_tx_digests = set()
+    
+    for e in events:
+        pjson = e.get("parsedJson", {})
+        pool_id = pjson.get("pool", "")
+        if pool_id:
+            unique_pool_ids.add(pool_id)
+            
+        tx_digest = e.get("id", {}).get("txDigest")
+        if tx_digest:
+            unique_tx_digests.add(tx_digest)
+
+    pool_tasks = [asyncio.create_task(get_pool_coins(session, pid)) for pid in unique_pool_ids]
+    tx_tasks = [asyncio.create_task(get_tx_block_info(session, digest)) for digest in unique_tx_digests]
+    
+    await asyncio.gather(*pool_tasks, *tx_tasks)
+
+    unique_coin_types = set()
+    for pid in unique_pool_ids:
+        coin_a, coin_b = _pool_cache.get(pid, ("Unknown", "Unknown"))
+        if coin_a: 
+            unique_coin_types.add(coin_a)
+        if coin_b:
+            unique_coin_types.add(coin_b)
+
+    coin_tasks = [asyncio.create_task(get_coin_metadata(session, ctype)) for ctype in unique_coin_types]
+    await asyncio.gather(*coin_tasks)
+
+    for e in events:
+        await _fill_single_event_from_cache(e)
+
+    return events
+
+###############################################################################
+# 9) WRITE EVENTS TO CSV
 ###############################################################################
 
 def write_events_to_csv_with_enrichment(events, output_csv="cetus_swap_events.csv"):
     """
-    Write the enriched events to CSV.
+    Enhanced version that includes checkpoint and transaction block info
     """
     fieldnames = [
         "txDigest",
         "eventSeq",
+        "checkpoint",
+        "timestampMs",
         "timestampIso",
         "sender",
         "type",
@@ -350,12 +390,13 @@ def write_events_to_csv_with_enrichment(events, output_csv="cetus_swap_events.cs
             tx_digest = event["id"]["txDigest"]
             seq = event["id"]["eventSeq"]
 
-            # Convert timestampMs to ISO8601 if present
+            checkpoint, tx_timestamp = _tx_cache.get(tx_digest, (None, None))
+            
             timestamp_iso = ""
-            timestamp_ms_str = event.get("timestampMs", "")
-            if timestamp_ms_str:
+            timestamp_ms = tx_timestamp or event.get("timestampMs", "")
+            if timestamp_ms:
                 try:
-                    ms_val = int(timestamp_ms_str)
+                    ms_val = int(timestamp_ms)
                     dt = datetime.utcfromtimestamp(ms_val / 1000.0)
                     timestamp_iso = dt.isoformat(timespec="seconds")
                 except:
@@ -369,6 +410,8 @@ def write_events_to_csv_with_enrichment(events, output_csv="cetus_swap_events.cs
             row = {
                 "txDigest": tx_digest,
                 "eventSeq": seq,
+                "checkpoint": checkpoint,
+                "timestampMs": timestamp_ms,
                 "timestampIso": timestamp_iso,
                 "sender": sender,
                 "type": etype,
@@ -388,12 +431,11 @@ def write_events_to_csv_with_enrichment(events, output_csv="cetus_swap_events.cs
             writer.writerow(row)
 
 ###############################################################################
-# 8) ASYNC MAIN
+# 10) ASYNC MAIN
 ###############################################################################
 
 async def main():
     async with aiohttp.ClientSession() as session:
-        # 1) Fetch events (paginated)
         events = await fetch_cetus_swap_events_paginated(
             session,
             pages=DEFAULT_PAGES,
@@ -402,13 +444,11 @@ async def main():
         )
         print(f"Total events fetched: {len(events)}")
 
-        # 2) Enrich events in a batched way
         start_enrich = time.time()
-        await enrich_events_with_pool_and_coin_data(session, events)
+        await enrich_events_with_all_data(session, events)
         end_enrich = time.time()
         print(f"Enrichment took {end_enrich - start_enrich:.2f} seconds.")
 
-    # 3) Write them to CSV
     start_csv = time.time()
     output_csv = "cetus_swap_events.csv"
     write_events_to_csv_with_enrichment(events, output_csv)
@@ -416,7 +456,7 @@ async def main():
     print(f"Wrote events to {output_csv} in {end_csv - start_csv:.2f} seconds.")
 
 ###############################################################################
-# 9) DRIVER
+# 11) DRIVER
 ###############################################################################
 
 if __name__ == "__main__":
